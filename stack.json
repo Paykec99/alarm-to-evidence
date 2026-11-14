@@ -1,0 +1,476 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "CloudWatch alarm notifications and AWS DevOps Agent investigation reports",
+  "Parameters": {
+    "AlarmName": {
+      "Type": "String",
+      "MinLength": 1
+    },
+    "EmailAddress": {
+      "Type": "String",
+      "AllowedPattern": "[^\\s@]+@[^\\s@]+\\.[^\\s@]+"
+    },
+    "EnableInvestigations": {
+      "Type": "String",
+      "Default": "false",
+      "AllowedValues": [
+        "false",
+        "true"
+      ]
+    },
+    "WebhookSecretArn": {
+      "Type": "String",
+      "Default": ""
+    }
+  },
+  "Rules": {
+    "RequireWebhookSecret": {
+      "RuleCondition": {
+        "Fn::Equals": [
+          {
+            "Ref": "EnableInvestigations"
+          },
+          "true"
+        ]
+      },
+      "Assertions": [
+        {
+          "Assert": {
+            "Fn::Not": [
+              {
+                "Fn::Equals": [
+                  {
+                    "Ref": "WebhookSecretArn"
+                  },
+                  ""
+                ]
+              }
+            ]
+          },
+          "AssertDescription": "Provide the Secrets Manager ARN before enabling investigations."
+        }
+      ]
+    }
+  },
+  "Conditions": {
+    "InvestigationsOn": {
+      "Fn::Equals": [
+        {
+          "Ref": "EnableInvestigations"
+        },
+        "true"
+      ]
+    },
+    "WebhookConfigured": {
+      "Fn::Not": [
+        {
+          "Fn::Equals": [
+            {
+              "Ref": "WebhookSecretArn"
+            },
+            ""
+          ]
+        }
+      ]
+    }
+  },
+  "Resources": {
+    "AgentSpace": {
+      "Type": "AWS::DevOpsAgent::AgentSpace",
+      "Properties": {
+        "Name": {
+          "Ref": "AWS::StackName"
+        },
+        "Description": "CloudWatch incident investigations"
+      }
+    },
+    "AgentRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "aidevops.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole",
+              "Condition": {
+                "StringEquals": {
+                  "aws:SourceAccount": {
+                    "Ref": "AWS::AccountId"
+                  }
+                },
+                "ArnLike": {
+                  "aws:SourceArn": {
+                    "Fn::Sub": "arn:${AWS::Partition}:aidevops:${AWS::Region}:${AWS::AccountId}:agentspace/*"
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "ManagedPolicyArns": [
+          {
+            "Fn::Sub": "arn:${AWS::Partition}:iam::aws:policy/AIDevOpsAgentAccessPolicy"
+          }
+        ],
+        "Policies": [
+          {
+            "PolicyName": "ResourceDiscovery",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": "iam:CreateServiceLinkedRole",
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/resource-explorer-2.amazonaws.com/AWSServiceRoleForResourceExplorer"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "Association": {
+      "Type": "AWS::DevOpsAgent::Association",
+      "Properties": {
+        "AgentSpaceId": {
+          "Fn::GetAtt": [
+            "AgentSpace",
+            "AgentSpaceId"
+          ]
+        },
+        "ServiceId": "aws",
+        "Configuration": {
+          "Aws": {
+            "AccountId": {
+              "Ref": "AWS::AccountId"
+            },
+            "AccountType": "monitor",
+            "AssumableRoleArn": {
+              "Fn::GetAtt": [
+                "AgentRole",
+                "Arn"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "Topic": {
+      "Type": "AWS::SNS::Topic",
+      "Properties": {}
+    },
+    "Subscriber": {
+      "Type": "AWS::SNS::Subscription",
+      "Properties": {
+        "Protocol": "email",
+        "Endpoint": {
+          "Ref": "EmailAddress"
+        },
+        "TopicArn": {
+          "Ref": "Topic"
+        }
+      }
+    },
+    "TopicPolicy": {
+      "Type": "AWS::SNS::TopicPolicy",
+      "Properties": {
+        "Topics": [
+          {
+            "Ref": "Topic"
+          }
+        ],
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "events.amazonaws.com"
+              },
+              "Action": "sns:Publish",
+              "Resource": {
+                "Ref": "Topic"
+              }
+            }
+          ]
+        }
+      }
+    },
+    "WorkerRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "ManagedPolicyArns": [
+          {
+            "Fn::Sub": "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+          }
+        ],
+        "Policies": [
+          {
+            "PolicyName": "IncidentActions",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": "aidevops:ListJournalRecords",
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "AgentSpace",
+                      "Arn"
+                    ]
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": "sns:Publish",
+                  "Resource": {
+                    "Ref": "Topic"
+                  }
+                },
+                {
+                  "Fn::If": [
+                    "WebhookConfigured",
+                    {
+                      "Effect": "Allow",
+                      "Action": "secretsmanager:GetSecretValue",
+                      "Resource": {
+                        "Ref": "WebhookSecretArn"
+                      }
+                    },
+                    {
+                      "Ref": "AWS::NoValue"
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "Worker": {
+      "Type": "AWS::Lambda::Function",
+      "Properties": {
+        "Runtime": "python3.13",
+        "Handler": "index.handler",
+        "Role": {
+          "Fn::GetAtt": [
+            "WorkerRole",
+            "Arn"
+          ]
+        },
+        "Timeout": 20,
+        "Environment": {
+          "Variables": {
+            "TOPIC": {
+              "Ref": "Topic"
+            },
+            "WEBHOOK_SECRET": {
+              "Ref": "WebhookSecretArn"
+            }
+          }
+        },
+        "Code": {
+          "ZipFile": "import base64\nimport hashlib\nimport hmac\nimport json\nfrom datetime import datetime, timezone\nimport os\nimport urllib.request\n\nimport boto3\n\n\ndef handler(event, context):\n    detail = event[\"detail\"]\n    if event[\"source\"] == \"aws.cloudwatch\":\n        config = json.loads(boto3.client(\"secretsmanager\").get_secret_value(\n            SecretId=os.environ[\"WEBHOOK_SECRET\"]\n        )[\"SecretString\"])\n        url = config[\"url\"]\n        expected = \"https://event-ai.\" + os.environ[\"AWS_REGION\"] + \".api.aws/webhook/generic/\"\n        if not url.startswith(expected):\n            raise ValueError(\"Unexpected DevOps Agent webhook URL\")\n        payload = {\n            \"eventType\": \"incident\",\n            \"incidentId\": event[\"id\"],\n            \"action\": \"created\",\n            \"priority\": \"HIGH\",\n            \"title\": detail[\"alarmName\"],\n            \"description\": \"Investigate CloudWatch alarm \" + event[\"resources\"][0]\n                           + \". Inspect related CloudWatch logs and metrics.\",\n            \"timestamp\": event[\"time\"],\n            \"service\": detail[\"alarmName\"],\n        }\n        body = json.dumps(payload).encode()\n        timestamp = datetime.now(timezone.utc).isoformat(timespec=\"milliseconds\").replace(\"+00:00\", \"Z\")\n        headers = {\"Content-Type\": \"application/json\", \"x-amzn-event-timestamp\": timestamp}\n        if \"hmac_secret\" in config:\n            signature = hmac.digest(config[\"hmac_secret\"].encode(),\n                                    timestamp.encode() + b\":\" + body, hashlib.sha256)\n            headers[\"x-amzn-event-signature\"] = base64.b64encode(signature).decode()\n        else:\n            headers[\"Authorization\"] = \"Bearer \" + config[\"token\"]\n        request = urllib.request.Request(url, data=body, headers=headers, method=\"POST\")\n        with urllib.request.urlopen(request, timeout=8) as response:\n            return {\"status\": response.status}\n\n    metadata = detail[\"metadata\"]\n    execution = metadata[\"execution_id\"]\n    status = event[\"detail-type\"]\n    summary_id = detail.get(\"data\", {}).get(\"summary_record_id\")\n    summary = \"Open the AWS DevOps Agent console for details.\"\n    if summary_id:\n        pages = boto3.client(\"devops-agent\").get_paginator(\"list_journal_records\").paginate(\n            agentSpaceId=metadata[\"agent_space_id\"], executionId=execution,\n            recordType=\"investigation_summary_md\")\n        report = next((record[\"content\"] for page in pages for record in page[\"records\"]\n                       if record[\"recordId\"] == summary_id), None)\n        if report is None:\n            raise RuntimeError(\"Investigation summary is not available yet\")\n        summary = report[:15000]\n    boto3.client(\"sns\").publish(TopicArn=os.environ[\"TOPIC\"],\n        Subject=\"AWS DevOps Agent: \" + status,\n        Message=f\"{status}\\nAgent Space: {metadata['agent_space_id']}\\nExecution: {execution}\\n\\n{summary}\")\n"
+        }
+      }
+    },
+    "AlarmNotification": {
+      "Type": "AWS::Events::Rule",
+      "Properties": {
+        "Name": {
+          "Fn::Sub": "${AWS::StackName}-notify"
+        },
+        "EventPattern": {
+          "source": [
+            "aws.cloudwatch"
+          ],
+          "detail-type": [
+            "CloudWatch Alarm State Change"
+          ],
+          "detail": {
+            "alarmName": [
+              {
+                "Ref": "AlarmName"
+              }
+            ],
+            "state": {
+              "value": [
+                "ALARM"
+              ]
+            }
+          }
+        },
+        "Targets": [
+          {
+            "Id": "Email",
+            "Arn": {
+              "Ref": "Topic"
+            },
+            "InputTransformer": {
+              "InputPathsMap": {
+                "alarm": "$.detail.alarmName",
+                "when": "$.time",
+                "region": "$.region"
+              },
+              "InputTemplate": "\"CloudWatch alarm <alarm> entered ALARM at <when> in <region>.\""
+            }
+          }
+        ]
+      }
+    },
+    "Investigations": {
+      "Type": "AWS::Events::Rule",
+      "Properties": {
+        "State": {
+          "Fn::If": [
+            "InvestigationsOn",
+            "ENABLED",
+            "DISABLED"
+          ]
+        },
+        "EventPattern": {
+          "source": [
+            "aws.cloudwatch"
+          ],
+          "detail-type": [
+            "CloudWatch Alarm State Change"
+          ],
+          "detail": {
+            "alarmName": [
+              {
+                "Ref": "AlarmName"
+              }
+            ],
+            "state": {
+              "value": [
+                "ALARM"
+              ]
+            }
+          }
+        },
+        "Targets": [
+          {
+            "Id": "Start",
+            "Arn": {
+              "Fn::GetAtt": [
+                "Worker",
+                "Arn"
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "Results": {
+      "Type": "AWS::Events::Rule",
+      "Properties": {
+        "EventPattern": {
+          "source": [
+            "aws.aidevops"
+          ],
+          "detail-type": [
+            "Investigation Completed",
+            "Investigation Failed",
+            "Investigation Timed Out",
+            "Investigation Cancelled"
+          ],
+          "detail": {
+            "metadata": {
+              "agent_space_id": [
+                {
+                  "Fn::GetAtt": [
+                    "AgentSpace",
+                    "AgentSpaceId"
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        "Targets": [
+          {
+            "Id": "Result",
+            "Arn": {
+              "Fn::GetAtt": [
+                "Worker",
+                "Arn"
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "InvestigationsPermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {
+          "Fn::GetAtt": [
+            "Worker",
+            "Arn"
+          ]
+        },
+        "Principal": "events.amazonaws.com",
+        "SourceArn": {
+          "Fn::GetAtt": [
+            "Investigations",
+            "Arn"
+          ]
+        }
+      }
+    },
+    "ResultsPermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {
+          "Fn::GetAtt": [
+            "Worker",
+            "Arn"
+          ]
+        },
+        "Principal": "events.amazonaws.com",
+        "SourceArn": {
+          "Fn::GetAtt": [
+            "Results",
+            "Arn"
+          ]
+        }
+      }
+    }
+  },
+  "Outputs": {
+    "AgentSpaceId": {
+      "Value": {
+        "Fn::GetAtt": [
+          "AgentSpace",
+          "AgentSpaceId"
+        ]
+      }
+    },
+    "TopicArn": {
+      "Value": {
+        "Ref": "Topic"
+      }
+    }
+  }
+}
